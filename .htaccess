@@ -1,0 +1,51 @@
+<IfModule mod_rewrite.c>
+    RewriteEngine On
+    
+    # If the request is for a real file or directory, serve it directly
+    RewriteCond %{REQUEST_FILENAME} -f
+    RewriteRule ^ - [L]
+    
+    RewriteCond %{REQUEST_FILENAME} -d
+    RewriteRule ^ - [L]
+    
+    # Route all requests for 4-6 character lowercase letters to index.php
+    # Case insensitive - accepts both upper and lower case
+    RewriteRule ^([a-zA-Z]{4,6})$ index.php?paste=$1 [L,QSA,NC]
+    
+    # Route home page
+    RewriteRule ^$ index.php [L]
+</IfModule>
+
+# Security: Prevent direct access to sensitive files
+<FilesMatch "\.(json|txt|log|sql)$">
+    Require all denied
+</FilesMatch>
+
+# Security: Block directory listing
+Options -Indexes
+
+# Set default character set
+AddDefaultCharset UTF-8
+
+# Enable compression for better performance
+<IfModule mod_deflate.c>
+    AddOutputFilterByType DEFLATE text/html text/plain text/css text/javascript application/javascript application/json
+</IfModule>
+
+# Cache static assets
+<IfModule mod_expires.c>
+    ExpiresActive On
+    ExpiresByType text/css "access plus 1 month"
+    ExpiresByType text/javascript "access plus 1 month"
+    ExpiresByType application/javascript "access plus 1 month"
+    ExpiresByType image/png "access plus 1 month"
+    ExpiresByType image/jpeg "access plus 1 month"
+</IfModule>
+
+# Security Headers
+<IfModule mod_headers.c>
+    Header set X-Frame-Options "DENY"
+    Header set X-XSS-Protection "1; mode=block"
+    Header set X-Content-Type-Options "nosniff"
+    Header set Referrer-Policy "strict-origin-when-cross-origin"
+</IfModule>
