@@ -1,7 +1,7 @@
 <?php
 /**
- * hilog Pastebin - Version 20.2
- * Fixed permanent blocking issue
+ * hilog Pastebin - Version 20.3
+ * Auto-delete expired pastes on every load
  */
 
 require_once __DIR__ . '/config.php';
@@ -23,12 +23,46 @@ function getClientIp() {
     return hash('sha256', $ip . ($_SERVER['HTTP_USER_AGENT'] ?? '') . SALT);
 }
 
+// ============================================
+// CLEAN EXPIRED PASTES - RUNS ON EVERY REQUEST
+// ============================================
+function cleanExpiredPastes() {
+    $db = getDB();
+    $currentTime = time();
+    
+    // حذف پیست‌های منقضی شده
+    $result = $db->query("SELECT id FROM pastes WHERE expires_at IS NOT NULL AND expires_at < $currentTime");
+    $expiredCount = $result->num_rows;
+    
+    if ($expiredCount > 0) {
+        $db->query("DELETE FROM pastes WHERE expires_at IS NOT NULL AND expires_at < $currentTime");
+        // می‌توانید لاگ یا اعلان اضافه کنید
+        // error_log("Cleaned $expiredCount expired pastes");
+    }
+    
+    return $expiredCount;
+}
+
+// حذف رکوردهای قدیمی rate limit (هر 10 بار یکبار اجرا شود)
+function cleanOldRateLimits() {
+    $db = getDB();
+    $currentTime = time();
+    $db->query("DELETE FROM rate_limits WHERE timestamp < " . ($currentTime - 7200));
+}
+
+// اجرای حذف در هر بار لود سایت
+cleanExpiredPastes();
+
+// اجرای پاکسازی rate limit با 10% شانس
+if (rand(1, 10) === 1) {
+    cleanOldRateLimits();
+}
+
 function checkRateLimit($pasteId) {
     $db = getDB();
     $clientIp = getClientIp();
     $currentTime = time();
     
-    // Clean old entries
     $db->query("DELETE FROM rate_limits WHERE timestamp < " . ($currentTime - ATTEMPT_WINDOW * 2));
     
     $pasteKey = "paste_{$pasteId}_{$clientIp}";
@@ -36,18 +70,15 @@ function checkRateLimit($pasteId) {
     $row = $result->fetch_assoc();
     
     if ($row) {
-        // بررسی اگر بلاک فعال است
         if ($row['blocked_until'] > $currentTime) {
             $remaining = ceil(($row['blocked_until'] - $currentTime) / 60);
             return ['allowed' => false, 'message' => "Too many attempts. Try again in {$remaining} minute" . ($remaining > 1 ? 's' : '') . "."];
         }
         
-        // اگر بلاک منقضی شده است، شمارش تلاش‌ها را ریست کن
         if ($row['blocked_until'] > 0 && $row['blocked_until'] <= $currentTime) {
             $db->query("DELETE FROM rate_limits WHERE key_name = '" . $db->real_escape_string($pasteKey) . "'");
             $row = null;
         }
-        // اگر بلاک نبود اما تعداد تلاش‌ها زیاد است
         elseif ($row['attempts'] >= MAX_ATTEMPTS_PER_PASTE) {
             $newBlockUntil = $currentTime + BLOCK_DURATION;
             $db->query("UPDATE rate_limits SET blocked_until = $newBlockUntil, attempts = attempts + 1, timestamp = $currentTime WHERE key_name = '" . $db->real_escape_string($pasteKey) . "'");
@@ -56,7 +87,6 @@ function checkRateLimit($pasteId) {
         }
     }
     
-    // بررسی محدودیت جهانی
     $globalKey = "global_{$clientIp}";
     $result = $db->query("SELECT attempts, blocked_until FROM rate_limits WHERE key_name = '" . $db->real_escape_string($globalKey) . "'");
     $row = $result->fetch_assoc();
@@ -87,18 +117,15 @@ function recordFailedAttempt($pasteId) {
     $clientIp = getClientIp();
     $currentTime = time();
     
-    // ثبت تلاش برای پیست خاص
     $pasteKey = "paste_{$pasteId}_{$clientIp}";
     $result = $db->query("SELECT attempts, blocked_until FROM rate_limits WHERE key_name = '" . $db->real_escape_string($pasteKey) . "'");
     $row = $result->fetch_assoc();
     
     if ($row) {
-        // اگر بلاک منقضی شده، رکورد را حذف کن و دوباره شروع کن
         if ($row['blocked_until'] > 0 && $row['blocked_until'] <= $currentTime) {
             $db->query("DELETE FROM rate_limits WHERE key_name = '" . $db->real_escape_string($pasteKey) . "'");
             $db->query("INSERT INTO rate_limits (key_name, attempts, timestamp, blocked_until) VALUES ('" . $db->real_escape_string($pasteKey) . "', 1, $currentTime, 0)");
         } 
-        // اگر بلاک فعال نیست، افزایش تلاش
         elseif ($row['blocked_until'] <= $currentTime) {
             $db->query("UPDATE rate_limits SET attempts = attempts + 1, timestamp = $currentTime WHERE key_name = '" . $db->real_escape_string($pasteKey) . "'");
         }
@@ -106,7 +133,6 @@ function recordFailedAttempt($pasteId) {
         $db->query("INSERT INTO rate_limits (key_name, attempts, timestamp, blocked_until) VALUES ('" . $db->real_escape_string($pasteKey) . "', 1, $currentTime, 0)");
     }
     
-    // ثبت تلاش جهانی
     $globalKey = "global_{$clientIp}";
     $result = $db->query("SELECT attempts, blocked_until FROM rate_limits WHERE key_name = '" . $db->real_escape_string($globalKey) . "'");
     $row = $result->fetch_assoc();
@@ -122,24 +148,6 @@ function recordFailedAttempt($pasteId) {
     } else {
         $db->query("INSERT INTO rate_limits (key_name, attempts, timestamp, blocked_until) VALUES ('" . $db->real_escape_string($globalKey) . "', 1, $currentTime, 0)");
     }
-}
-
-function cleanExpiredPastes() {
-    $db = getDB();
-    $db->query("DELETE FROM pastes WHERE expires_at IS NOT NULL AND expires_at < " . time());
-}
-
-// Clean rate limit old entries
-function cleanOldRateLimits() {
-    $db = getDB();
-    $currentTime = time();
-    // حذف رکوردهای قدیمی‌تر از 2 ساعت
-    $db->query("DELETE FROM rate_limits WHERE timestamp < " . ($currentTime - 7200));
-}
-
-if (rand(1, 100) === 1) {
-    cleanExpiredPastes();
-    cleanOldRateLimits();
 }
 
 function generateLetterId() {
@@ -327,7 +335,10 @@ function viewPaste($id) {
     showPasteContent($id, $content, $paste);
 }
 
-// توابع نمایش (همانند نسخه قبلی)
+// ============================================
+// توابع نمایش (همانند نسخه قبل)
+// ============================================
+
 function showHomePage($deleted = false) {
     $error = isset($_GET['error']) ? htmlspecialchars($_GET['error'], ENT_QUOTES, 'UTF-8') : '';
     $baseUrl = getBaseUrl();
@@ -340,7 +351,7 @@ function showHomePage($deleted = false) {
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
 <title>hilog · Secure Pastebin</title>
-<link rel="stylesheet" href="' . $baseUrl . '/style.css?v=20.2">
+<link rel="stylesheet" href="' . $baseUrl . '/style.css?v=20.3">
 </head>
 <body>
 <div class="noise"></div>
@@ -351,7 +362,7 @@ function showHomePage($deleted = false) {
         <a href="' . $baseUrl . '/" class="logo">
             <span class="logo-icon">✨</span>
             <span class="logo-text">hilog</span>
-            <span class="logo-badge">v20.2</span>
+            <span class="logo-badge">v20.3</span>
         </a>
         <nav class="nav">
             <a href="' . $baseUrl . '/" class="nav-btn">+ Create</a>
@@ -369,9 +380,9 @@ function showHomePage($deleted = false) {
     }
     
     echo '<div class="hero">
-        <div class="hero-badge"><span class="badge-dot"></span> Letters Only URLs · Delete Your Pastes</div>
+        <div class="hero-badge"><span class="badge-dot"></span> Auto-Expire · Delete Your Pastes</div>
         <h1 class="hero-title">Share code<br>in <span class="gradient-text">seconds</span></h1>
-        <p class="hero-desc">Clean URLs with only letters (a-z). Secure, encrypted, and private. You can delete your pastes anytime.</p>
+        <p class="hero-desc">Clean URLs with only letters (a-z). Secure, encrypted, and private. Expired pastes are automatically deleted.</p>
     </div>
     
     <div class="form-wrapper">
@@ -429,13 +440,13 @@ function showHomePage($deleted = false) {
             </div>
             <div class="info-card">
                 <div class="info-icon">🗑️</div>
-                <h3>Delete Your Pastes</h3>
-                <p>After viewing a paste, you can delete it immediately. Perfect for one-time sharing and sensitive information.</p>
+                <h3>Auto-Expiration</h3>
+                <p>Pastes are automatically deleted when they expire. No leftover data, no manual cleanup needed.</p>
             </div>
             <div class="info-card">
                 <div class="info-icon">🛡️</div>
                 <h3>Brute Force Protection</h3>
-                <p>Rate limiting: 10 attempts per paste, 30 attempts per IP per hour. Blocks for 15 minutes after limit reached. Automatically resets after block expires.</p>
+                <p>Rate limiting: 10 attempts per paste, 30 attempts per IP per hour. Blocks for 15 minutes after limit reached. Auto-reset after block expires.</p>
             </div>
             <div class="info-card">
                 <div class="info-icon">🔗</div>
@@ -459,21 +470,21 @@ function showHomePage($deleted = false) {
                 <div class="security-item"><strong>Password Storage:</strong> Only SHA-256 hashes, never plain text</div>
                 <div class="security-item"><strong>Key Derivation:</strong> PBKDF2 with 10,000 iterations</div>
                 <div class="security-item"><strong>Rate Limiting:</strong> 10 attempts per paste, 30 per IP/hour</div>
+                <div class="security-item"><strong>Auto-Expire:</strong> Pastes deleted immediately after expiration</div>
                 <div class="security-item"><strong>Block Duration:</strong> 15 minutes after limit reached (auto-reset)</div>
                 <div class="security-item"><strong>Delete Feature:</strong> Instant paste deletion after viewing</div>
                 <div class="security-item"><strong>IP Hashing:</strong> Client IPs are hashed for privacy</div>
-                <div class="security-item"><strong>Auto Cleanup:</strong> Expired pastes removed automatically</div>
             </div>
         </div>
         
         <div class="footer-note">
-            <p>✨ Open source · No accounts · No tracking · Delete your pastes · Brute force protected · Your data, your control</p>
+            <p>✨ Open source · No accounts · No tracking · Auto-expire · Brute force protected · Your data, your control</p>
         </div>
     </div>
 </main>
 
 <footer class="footer">
-    <p>hilog · v20.2 · auto-reset after 15 minutes · brute force protected</p>
+    <p>hilog · v20.3 · auto-expire · delete your pastes · brute force protected · letters only URLs</p>
 </footer>
 
 <script>
@@ -488,6 +499,9 @@ setTimeout(() => {
 </html>';
 }
 
+// توابع دیگر (showCreatedPaste, showRateLimitError, showPasswordForm, showPasteContent) 
+// مانند نسخه قبلی باقی می‌مانند
+
 function showCreatedPaste($id) {
     $baseUrl = getBaseUrl();
     $fullUrl = $baseUrl . '/' . $id;
@@ -500,7 +514,7 @@ function showCreatedPaste($id) {
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Paste Created · hilog</title>
-<link rel="stylesheet" href="' . $baseUrl . '/style.css?v=20.2">
+<link rel="stylesheet" href="' . $baseUrl . '/style.css?v=20.3">
 </head>
 <body>
 <div class="noise"></div>
@@ -511,7 +525,7 @@ function showCreatedPaste($id) {
         <a href="' . $baseUrl . '/" class="logo">
             <span class="logo-icon">✨</span>
             <span class="logo-text">hilog</span>
-            <span class="logo-badge">v20.2</span>
+            <span class="logo-badge">v20.3</span>
         </a>
         <nav class="nav">
             <a href="' . $baseUrl . '/" class="nav-btn">+ Create</a>
@@ -549,13 +563,13 @@ function showCreatedPaste($id) {
         </div>
         <div class="paste-tip" style="margin-top: 0.5rem;">
             <span>🗑️</span>
-            <small>You can delete this paste after viewing it</small>
+            <small>You can delete this paste after viewing it, or it will expire automatically</small>
         </div>
     </div>
 </main>
 
 <footer class="footer">
-    <p>hilog · v20.2 · delete your pastes</p>
+    <p>hilog · v20.3 · auto-expire</p>
 </footer>
 
 <script>
@@ -585,7 +599,7 @@ function showRateLimitError($message) {
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Rate Limited · hilog</title>
-<link rel="stylesheet" href="' . $baseUrl . '/style.css?v=20.2">
+<link rel="stylesheet" href="' . $baseUrl . '/style.css?v=20.3">
 </head>
 <body class="password-page">
 <div class="noise"></div>
@@ -595,7 +609,7 @@ function showRateLimitError($message) {
         <a href="' . $baseUrl . '/" class="logo">
             <span class="logo-icon">✨</span>
             <span class="logo-text">hilog</span>
-            <span class="logo-badge">v20.2</span>
+            <span class="logo-badge">v20.3</span>
         </a>
         <nav class="nav">
             <a href="' . $baseUrl . '/" class="nav-btn">+ Create</a>
@@ -620,7 +634,7 @@ function showRateLimitError($message) {
 </main>
 
 <footer class="footer">
-    <p>hilog · v20.2 · auto-reset after 15 minutes</p>
+    <p>hilog · v20.3 · auto-reset after 15 minutes</p>
 </footer>
 </body>
 </html>';
@@ -638,7 +652,7 @@ function showPasswordForm($id, $error) {
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Protected · hilog</title>
-<link rel="stylesheet" href="' . $baseUrl . '/style.css?v=20.2">
+<link rel="stylesheet" href="' . $baseUrl . '/style.css?v=20.3">
 </head>
 <body class="password-page">
 <div class="noise"></div>
@@ -648,7 +662,7 @@ function showPasswordForm($id, $error) {
         <a href="' . $baseUrl . '/" class="logo">
             <span class="logo-icon">✨</span>
             <span class="logo-text">hilog</span>
-            <span class="logo-badge">v20.2</span>
+            <span class="logo-badge">v20.3</span>
         </a>
         <nav class="nav">
             <a href="' . $baseUrl . '/" class="nav-btn">+ Create</a>
@@ -682,7 +696,7 @@ function showPasswordForm($id, $error) {
 </main>
 
 <footer class="footer">
-    <p>hilog · v20.2 · brute force protected</p>
+    <p>hilog · v20.3 · brute force protected</p>
 </footer>
 </body>
 </html>';
@@ -701,7 +715,7 @@ function showPasteContent($id, $content, $metadata) {
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Paste ' . htmlspecialchars($id, ENT_QUOTES, 'UTF-8') . ' · hilog</title>
-<link rel="stylesheet" href="' . $baseUrl . '/style.css?v=20.2">
+<link rel="stylesheet" href="' . $baseUrl . '/style.css?v=20.3">
 </head>
 <body>
 <div class="noise"></div>
@@ -712,7 +726,7 @@ function showPasteContent($id, $content, $metadata) {
         <a href="' . $baseUrl . '/" class="logo">
             <span class="logo-icon">✨</span>
             <span class="logo-text">hilog</span>
-            <span class="logo-badge">v20.2</span>
+            <span class="logo-badge">v20.3</span>
         </a>
         <nav class="nav">
             <a href="' . $baseUrl . '/" class="nav-btn">+ Create</a>
@@ -765,12 +779,12 @@ function showPasteContent($id, $content, $metadata) {
     
     <div class="security-warning">
         <span>⚠️</span>
-        <small>This paste will be permanently deleted after expiration or manual deletion.</small>
+        <small>This paste will be automatically deleted after expiration or by manual deletion.</small>
     </div>
 </main>
 
 <footer class="footer">
-    <p>hilog · v20.2 · delete your pastes · ' . $id . '</p>
+    <p>hilog · v20.3 · auto-expire · ' . $id . '</p>
 </footer>
 
 <script>
